@@ -1,0 +1,588 @@
+---
+title: "Simpop"
+author: "Ziqi Xu"
+date: "2025-08-15"
+output: html_document
+---
+```{r warning=FALSE, message=FALSE}
+# install.packages(c("gtools", "rpart", "mice", "MASS", "survival"))
+# install.packages("synthpop")
+library(synthpop)
+set.seed(202508)
+```
+
+```{r warning=FALSE, message=FALSE}
+score_cols <- c("bad.score.25","kue.score.23")
+for (v in intersect(score_cols, names(data.xu))) {
+
+  vals <- suppressWarnings(as.integer(as.character(data.xu[[v]])))
+  if (all(!is.na(vals))) {
+    lvls <- sort(unique(vals))
+    data.xu[[v]] <- ordered(factor(vals, levels = lvls), levels = lvls)
+  } else {
+    lvls <- sort(unique(as.character(data.xu[[v]])))
+    data.xu[[v]] <- ordered(factor(data.xu[[v]], levels = lvls), levels = lvls)
+  }
+}
+
+
+
+#Convert columns that are clearly categorical/indicator variables to factors.
+factor_cols <- c(
+  "Zentral", "WL", "Gebtyp.25", "Haustyp.23", "HZ.unvoll", "Fussboden.HZ",
+  "bad.score.25", "Kueche.offen", "Modern.Boden", "Balkon.Terrasse", "Besond.Ausst", "Modern.Fenster"
+)
+
+for (v in factor_cols) {
+  if (v %in% names(data.xu)) {
+    data.xu[[v]] <- as.factor(data.xu[[v]])
+  }
+}
+
+#Continuous variables remain numeric
+num_cols <- c("nmqm", "wfl.gekappt", "bj", "(weights)")
+for (v in num_cols) {
+  if (v %in% names(data.xu)) {
+    data.xu[[v]] <- as.numeric(data.xu[[v]])
+  }
+}
+```
+
+```{r warning=FALSE}
+# visit.sequence：Variable synthesis order
+visit.sequence <- c(
+  "Zentral","WL","Gebtyp.25","Haustyp.23",
+  "Boden.Fak.23","bad.score.25","kue.score.23",
+  "Kueche.offen","HZ.unvoll","Fussboden.HZ",
+  "Modern.Boden","Modern.Fenster","Balkon.Terrasse",
+  "Besond.Ausst","bj","wfl.gekappt","nmqm","(weights)"
+) #  (weights) It is recommended to place this at the end and set it to “Do not combine.”
+
+# method：Specify methods for each variable (aligned with visit.sequence or named after data column names)
+method_synthpop <- mice::make.method(data.xu)
+pred_synthpop   <- mice::make.predictorMatrix(data.xu)
+
+
+# continuous variable
+method_synthpop["bj"]           <- "normrank"
+method_synthpop["wfl.gekappt"]  <- "normrank"
+method_synthpop["nmqm"]         <- "normrank"
+
+for (v in c("WL","Gebtyp.25","Haustyp.23","Boden.Fak.23")) {
+  if (v %in% names(data.xu)) method_synthpop[v] <- "polyreg"
+}
+
+
+if ("bad.score.25" %in% names(data.xu)) method_synthpop["bad.score.25"] <- "polr"
+if ("kue.score.23" %in% names(data.xu)) method_synthpop["kue.score.23"] <- "polr"
+
+## Binary indicator: Logistic regression (or cart, binary choice; logreg is used here)
+method_synthpop["Zentral"]         <- "logreg"
+method_synthpop["HZ.unvoll"]       <- "logreg"
+method_synthpop["Fussboden.HZ"]    <- "logreg"
+method_synthpop["Kueche.offen"]    <- "logreg"
+method_synthpop["Modern.Boden"]    <- "logreg"
+method_synthpop["Modern.Fenster"]  <- "logreg"
+method_synthpop["Balkon.Terrasse"] <- "logreg"
+method_synthpop["Besond.Ausst"]    <- "logreg"
+
+#Weight column: Do not aggregate (copy over)
+method_synthpop["(weights)"] <- ""
+
+#Adjust predictor.matrix to avoid (weights) looping itself.
+if ("(weights)" %in% colnames(pred_synthpop)) {
+  pred_synthpop["(weights)", ] <- 0
+  pred_synthpop[, "(weights)"] <- 0
+}
+diag(pred_synthpop) <- 0
+
+#Simple physical constraints to avoid unreasonable values 
+rules_list <- list()
+if ("nmqm" %in% names(data.xu))        rules_list$nmqm        <- "result <- pmax(nmqm, 0)"
+if ("wfl.gekappt" %in% names(data.xu)) rules_list$wfl.gekappt <- "result <- pmax(wfl.gekappt, 0)"
+if ("bj" %in% names(data.xu))          rules_list$bj          <- "result <- pmax(bj, 1850)"
+
+```
+
+```{r warning=FALSE,message=FALSE}
+#Synthesize a set of data
+syn_out <- syn(
+  data.xu,
+  method = method_synthpop,
+  predictor.matrix= pred_synthpop,
+  visit.sequence  = visit.sequence,
+  m = 1,
+  seed = 202508 
+)
+
+syn_data <- syn_out$syn
+
+```
+
+```{r message=FALSE, warning=FALSE}
+# evaluation part
+############################################################
+# Evaluation & Visualization for Synthetic vs Real (Rents)
+# Assumes: data.xu  (real), syn_data (synthetic from synthpop)
+############################################################
+
+# ---- Packages ----
+pkgs <- c("dplyr","ggplot2","GGally","pROC","rsample","yardstick","glmnet")
+to_install <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if (length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(202508)
+
+# ---- 0) Align columns & types ----
+common_cols <- intersect(names(data.xu), names(syn_data))
+real <- data.xu[, common_cols, drop = FALSE]
+syn  <- syn_data[, common_cols, drop = FALSE]
+
+# Ensure ordered factors for scores (as you required)
+for (v in intersect(score_cols, names(real))) {
+  # coerce both datasets to ordered with same levels
+  r_lv <- sort(unique(real[[v]]))
+  real[[v]] <- ordered(real[[v]], levels = r_lv)
+  syn[[v]]  <- ordered(syn[[v]],  levels = r_lv)
+}
+
+# ---- Helper: numeric-only columns ----
+is_num <- sapply(real, is.numeric)
+num_cols <- names(real)[is_num]
+
+is_fac <- sapply(real, is.factor) | sapply(real, is.ordered)
+fac_cols <- names(real)[is_fac]
+
+# Choose a main continuous target for rent analysis
+target_synthpop <- if ("nmqm" %in% names(real)) "nmqm" else num_cols[1]
+
+############################################################
+# 1) Descriptive Utility
+############################################################
+
+# 1.1 Univariate distributions: hist/density for key numeric vars
+plot_univariate_numeric <- function(var) {
+  df <- bind_rows(
+    real %>% select(all_of(var)) %>% mutate(source = "Real"),
+    syn  %>% select(all_of(var)) %>% mutate(source = "Synthetic")
+  )
+  
+  ggplot(df, aes_string(x = var, fill = "source", color = "source")) +
+    geom_histogram(aes(y = ..density..), alpha = 0.6, position = "identity", bins = 30) +
+    geom_density(size = 0.9, alpha = 0) +
+    labs(title = paste("Univariate distribution:", var),
+         x = var, y = "Density") +
+    theme_minimal()
+}
+
+
+# Example: plot for target & a couple of other numeric vars
+plots_synthpop_uni_num <- lapply(head(num_cols,3), plot_univariate_numeric)
+
+# 1.2 Correlation structure heatmaps (numeric only)
+corr_mat <- function(df) {
+  cormat <- cor(df[, num_cols, drop = FALSE], use = "pairwise.complete.obs")
+  cormat[is.na(cormat)] <- 0
+  cormat
+}
+
+corr_real <- corr_mat(real)
+corr_syn  <- corr_mat(syn)
+
+# Visual compare using GGally::ggcorr
+ggcorr_plot_real <- GGally::ggcorr(as.data.frame(real[, num_cols]), label = TRUE) + ggtitle("Correlation (Real)")
+ggcorr_plot_syn  <- GGally::ggcorr(as.data.frame(syn[, num_cols]),  label = TRUE) + ggtitle("Correlation (Synthetic)")
+
+
+############################################################
+# 1.3 Categorical cross-tabs & SRMSE for three selected pairs
+############################################################
+
+# Define the three categorical pairs to evaluate
+cat_pairs <- list(
+  c("WL", "Gebtyp.25"),           # Macro level: location × building type
+  c("Haustyp.23", "Boden.Fak.23"),# Meso level: dwelling type × floor material
+  c("bj", "Modern.Fenster")       # Micro level: construction year × window modernization
+)
+
+# Function to compute Scaled Root Mean Squared Error (SRMSE)
+SRMSE <- function(obs, exp) {
+  eps <- 1e-9
+  sqrt(mean(((obs - exp) / (sqrt((obs + exp)/2) + eps))^2))
+}
+
+# Loop over the three pairs and compute SRMSE
+srmse_results <- lapply(cat_pairs, function(vp) {
+  v1 <- vp[1]; v2 <- vp[2]
+  
+  # If the variables are missing, return NA
+  if (!all(c(v1, v2) %in% names(real))) {
+    return(data.frame(pair = paste(v1, v2, sep = " x "),
+                      SRMSE = NA))
+  }
+  
+  # Proportion tables for real vs. synthetic data
+  tab_r <- prop.table(table(real[[v1]], real[[v2]]))
+  tab_s <- prop.table(table(syn [[v1]], syn [[v2]]))
+  
+  # Align categories (rows & columns) to avoid mismatched levels
+  all_lv1 <- union(rownames(tab_r), rownames(tab_s))
+  all_lv2 <- union(colnames(tab_r), colnames(tab_s))
+  tab_r <- tab_r[all_lv1, all_lv2, drop = FALSE]; tab_r[is.na(tab_r)] <- 0
+  tab_s <- tab_s[all_lv1, all_lv2, drop = FALSE]; tab_s[is.na(tab_s)] <- 0
+  
+  # Compute SRMSE for the pair
+  data.frame(pair = paste(v1, v2, sep = " x "),
+             SRMSE = SRMSE(as.vector(tab_r), as.vector(tab_s)))
+})
+
+# Collect results in a single data frame
+srmse_df <- bind_rows(srmse_results)
+print(srmse_df)
+
+############################################################
+# 2) Analytical Utility
+############################################################
+
+# 2.1 Regression consistency: compare estimates on Real vs Synthetic
+# Choose a baseline linear model for rent per sqm (nmqm) ~ size/age/amenities (modify to your columns)
+reg_formula_synthpop <- as.formula(paste(target_synthpop,
+                                "~ wfl.gekappt + bj + Zentral + WL + Modern.Boden + Modern.Fenster + Balkon.Terrasse"))
+
+fit_real_synthpop <- lm(reg_formula_synthpop, data = real)
+fit_syn_synthpop  <- lm(reg_formula_synthpop, data = syn)
+
+coef_tab_synthpop <- data.frame(
+  term = names(coef(fit_real_synthpop)),
+  beta_real = coef(fit_real_synthpop),
+  beta_syn  = coef(fit_syn_synthpop)
+)
+print(coef_tab_synthpop)
+
+
+
+exclude_synthpop <- c(target_synthpop, "(weights)")
+preds_synthpop   <- setdiff(names(real), exclude_synthpop)
+reg_formula_synthpop_full <- as.formula(paste(target_synthpop, "~", paste(preds_synthpop, collapse = " + ")))
+
+fit_real_synthpop_full <- lm(reg_formula_synthpop_full, data = real)
+fit_syn_synthpop_full  <- lm(reg_formula_synthpop_full, data = syn)
+
+coef_tab_synthpop_full <- data.frame(
+  term = names(coef(fit_real_synthpop_full)),
+  beta_real = coef(fit_real_synthpop_full),
+  beta_syn  = coef(fit_syn_synthpop_full)
+)
+
+# Relative efficiency (RE) on selected coefficients
+se_real_synthpop <- sqrt(diag(vcov(fit_real_synthpop)))
+se_syn_synthpop <- sqrt(diag(vcov(fit_syn_synthpop)))
+re_tab_synthpop <- data.frame(
+  term = names(se_real_synthpop),
+  SE_real = as.numeric(se_real_synthpop),
+  SE_syn  = as.numeric(se_syn_synthpop),
+  RE = (se_syn_synthpop^2)/(se_real_synthpop^2)
+)
+print(re_tab_synthpop)
+
+# --- Visualization: Real vs Synthetic coefficients with 45° ideal line ---
+coef_plot_synthpop_full <- coef_tab_synthpop_full[-1,]
+names(coef_plot_synthpop) <- c("term","beta_real","beta_syn")
+
+plot_coef_synthpop <- ggplot(coef_plot_synthpop_full, aes(x = beta_real, y = beta_syn)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +  # ideal y = x
+  labs(title = "Coefficient Agreement (Ideal: y = x)",
+       x = "β (Real)", y = "β (Synthetic)") +
+  theme_minimal()
+
+# --- Visualization: Relative Efficiency per term with ideal baseline at 1 ---
+re_plot_synthpop <- re_tab_synthpop
+re_plot_synthpop$term <- factor(re_plot_synthpop$term, levels = re_plot_synthpop$term)
+
+ggplot(re_plot_synthpop, aes(x = term, y = RE)) +
+  geom_col(width = 0.6, fill = "skyblue") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +  # ideal baseline
+  labs(title = "Relative Efficiency (Ideal = 1)",
+       x = "Term", y = "RE = (SE_syn^2 / SE_real^2)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 50, hjust = 1))
+
+
+# 2.2 Predictive parity: TSTR vs TRTR
+# Define a simple split on the real data; train on synthetic and real, test on holdout real
+set.seed(202508)
+split_real_1 <- initial_split(real, prop = 0.8)
+train_real_1 <- training(split_real_1)
+test_real_1  <- testing(split_real_1)
+
+# Fit models
+fit_trtr_1 <- lm(reg_formula_synthpop, data = train_real_1)     # train on real, test on real
+fit_tstr_1 <- lm(reg_formula_synthpop, data = syn)            # train on synthetic, test on real
+
+pred_trtr_1 <- predict(fit_trtr_1, newdata = test_real_1)
+pred_tstr_1 <- predict(fit_tstr_1, newdata = test_real_1)
+
+perf_synthpop <- tibble(
+  model = c("TRTR","TSTR"),
+  RMSE  = c(rmse_vec(test_real_1[[target_synthpop]], pred_trtr_1),
+            rmse_vec(test_real_1[[target_synthpop]], pred_tstr_1)),
+  MAE   = c(mae_vec(test_real_1[[target_synthpop]], pred_trtr_1),
+            mae_vec(test_real_1[[target_synthpop]], pred_tstr_1))
+)
+print(perf_synthpop)
+
+############################################################
+# 3) Privacy Risk (simplified linkage proxy)
+############################################################
+# A naive nearest-neighbor re-identification rate proxy on a subset of quasi-identifiers
+qid <- c("WL","Gebtyp.25","Haustyp.23","Boden.Fak.23","bj","wfl.gekappt")
+qid_1 <- intersect(qid, names(real))
+
+# discretize continuous qids for simple matching
+disc <- function(x, bins = 10) {
+  if (is.numeric(x)) cut(x, breaks = unique(quantile(x, probs = seq(0,1,length.out = bins+1), na.rm=TRUE)), include.lowest = TRUE)
+  else x
+}
+
+Real_qid_1 <- as.data.frame(lapply(real[qid_1], disc))
+Syn_qid_1 <- as.data.frame(lapply(syn [qid_1], disc))
+
+# compute exact row-wise matches of quasi-identifier tuples (upper bound-ish)
+Real_key_1 <- do.call(paste, c(Real_qid_1, sep = "|"))
+Syn_key_1 <- do.call(paste, c(Syn_qid_1, sep = "|"))
+
+match_rate <- mean(Real_key_1 %in% Syn_key_1)
+cat(sprintf("Naive re-identification match rate (upper-bound-ish): %.4f\n", match_rate))
+
+############################################################
+# 4) Fidelity / Fairness: Hellinger distance per numeric var & group-wise parity
+############################################################
+hellinger <- function(p, q) {
+  # p, q are densities on same grid, sum to 1
+  sqrt(sum((sqrt(p) - sqrt(q))^2))/sqrt(2)
+}
+
+# numeric vars HD via histogram densities on common breaks
+hd_list_1 <- lapply(head(num_cols, 5), function(v) {
+  br <- pretty(range(c(real[[v]], syn[[v]]), na.rm=TRUE), n = 20)
+  pr <- hist(real[[v]], breaks = br, plot = FALSE)
+  ps <- hist(syn [[v]], breaks = br, plot = FALSE)
+  p  <- pr$counts / sum(pr$counts)
+  q  <- ps$counts / sum(ps$counts)
+  data.frame(var = v, Hellinger = hellinger(p, q))
+})
+hd_df_1 <- bind_rows(hd_list_1)
+print(hd_df_1)
+
+# Group fairness check: compare means by a categorical group (e.g., WL) in real vs synthetic
+grp_1 <- "WL"
+if (grp_1 %in% fac_cols) {
+  agg_real <- real %>% group_by(.data[[grp_1]]) %>% summarize(mean_target = mean(.data[[target_synthpop]], na.rm=TRUE), .groups="drop")
+  agg_syn  <- syn  %>% group_by(.data[[grp_1]]) %>%  summarize(mean_target = mean(.data[[target_synthpop]], na.rm=TRUE), .groups="drop")
+  agg <- full_join(agg_real %>% rename(mean_real = mean_target),
+                   agg_syn  %>% rename(mean_syn  = mean_target),
+                   by = grp_1)
+  print(agg)
+  
+  gg_grp <- bind_rows(
+    real %>% mutate(source = "Real"),
+    syn  %>% mutate(source = "Synthetic")
+  ) %>%
+    ggplot(aes(x = .data[[grp_1]], y = .data[[target_synthpop]], fill = source)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6, position = position_dodge(width = 0.8)) +
+    coord_cartesian(ylim = quantile(real[[target_synthpop]], c(0.02,0.98), na.rm=TRUE)) +
+    labs(title = paste("Group-wise distribution of", target_synthpop, "by", grp_1),
+         x = grp_1, y = target_synthpop) +
+    theme_minimal()
+  print(gg_grp)
+}
+
+# ---- Fairness by another group: Gebtyp.25 ----
+grp_2 <- "Gebtyp.25"
+if (grp_2 %in% fac_cols) {
+  agg_real_2 <- real %>%
+    dplyr::group_by(.data[[grp_2]]) %>%
+    dplyr::summarize(mean_target = mean(.data[[target_synthpop]], na.rm = TRUE), .groups = "drop")
+  agg_syn_2  <- syn %>%
+    dplyr::group_by(.data[[grp_2]]) %>%
+    dplyr::summarize(mean_target = mean(.data[[target_synthpop]], na.rm = TRUE), .groups = "drop")
+
+  agg_2 <- dplyr::full_join(
+    agg_real_2 %>% dplyr::rename(mean_real = mean_target),
+    agg_syn_2  %>% dplyr::rename(mean_syn  = mean_target),
+    by = grp_2
+  )
+  print(agg_2)
+
+  gg_grp_2 <- dplyr::bind_rows(
+    real %>% dplyr::mutate(source = "Real"),
+    syn  %>% dplyr::mutate(source = "Synthetic")
+  ) %>%
+    ggplot2::ggplot(ggplot2::aes(x = .data[[grp_2]], y = .data[[target_synthpop]], fill = source)) +
+    ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.6,
+                          position = ggplot2::position_dodge(width = 0.8)) +
+    ggplot2::coord_cartesian(ylim = stats::quantile(real[[target_synthpop]], c(0.02, 0.98), na.rm = TRUE)) +
+    ggplot2::labs(title = paste("Group-wise distribution of", target_synthpop, "by", grp_2),
+                  x = grp_2, y = target_synthpop) +
+    ggplot2::theme_minimal()
+  print(gg_grp_2)
+}
+
+```
+
+```{r warning=FALSE}
+# ========= Export all synthpop evaluation outputs (figures + LaTeX tables) =========
+# NOTE: This chunk does not modify any objects created earlier. It only reads them
+# (e.g., srmse_df, coef_tab_synthpop, re_tab_synthpop, perf_synthpop, hd_df_1, agg,
+#        plots_synthpop_uni_num, ggcorr_plot_real, ggcorr_plot_syn,
+#        plot_coef_synthpop, gg_grp, etc.)
+# and writes: figures via ggsave + LaTeX tables via knitr::kable.
+# -----------------------------------------------------------------------------------
+
+# ---- Packages for export ----
+pkgs_exp <- c("ggplot2","knitr","kableExtra")
+to_install_exp <- pkgs_exp[!(pkgs_exp %in% installed.packages()[,"Package"])]
+if (length(to_install_exp)) install.packages(to_install_exp)
+invisible(lapply(pkgs_exp, library, character.only = TRUE))
+
+# ---- Output directories ----
+out_dir_fig <- "figs/synthpop"
+out_dir_tab <- "tabs/synthpop"
+dir.create(out_dir_fig, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_dir_tab, showWarnings = FALSE, recursive = TRUE)
+
+# ---------------- Figures ----------------
+
+# 1) Univariate distributions (list of ggplots: plots_synthpop_uni_num)
+if (exists("plots_synthpop_uni_num") && length(plots_synthpop_uni_num) > 0) {
+  for (i in seq_along(plots_synthpop_uni_num)) {
+    p <- plots_synthpop_uni_num[[i]]
+    if (inherits(p, "ggplot")) {
+      ggsave(filename = file.path(out_dir_fig, sprintf("synthpop_univariate_%02d.pdf", i)),
+             plot = p, width = 7, height = 4.5, dpi = 300)
+    }
+  }
+}
+
+# 2) Correlation heatmaps (ggcorr_plot_real / ggcorr_plot_syn)
+if (exists("ggcorr_plot_real") && inherits(ggcorr_plot_real, "ggplot")) {
+  ggsave(file.path(out_dir_fig, "synthpop_corr_real.pdf"),
+         plot = ggcorr_plot_real, width = 6.5, height = 6.0, dpi = 300)
+}
+if (exists("ggcorr_plot_syn") && inherits(ggcorr_plot_syn, "ggplot")) {
+  ggsave(file.path(out_dir_fig, "synthpop_corr_syn.pdf"),
+         plot = ggcorr_plot_syn, width = 6.5, height = 6.0, dpi = 300)
+}
+
+# 3) Coefficient agreement scatter (plot_coef_synthpop)
+if (exists("plot_coef_synthpop") && inherits(plot_coef_synthpop, "ggplot")) {
+  ggsave(file.path(out_dir_fig, "synthpop_coef_agreement.pdf"),
+         plot = plot_coef_synthpop, width = 6.2, height = 5.0, dpi = 300)
+}
+
+# 4) Relative Efficiency bar plot (re_plot_synthpop data -> build a ggplot object here)
+if (exists("re_plot_synthpop")) {
+  # Reconstruct the RE plot as an object (earlier it was directly printed)
+  re_plot_obj_synthpop <- ggplot(re_plot_synthpop, aes(x = term, y = RE)) +
+    geom_col(width = 0.6, fill = "skyblue") +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+    labs(title = "Relative Efficiency (Ideal = 1)",
+         x = "Term", y = "RE = (SE_syn^2 / SE_real^2)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 50, hjust = 1))
+  ggsave(file.path(out_dir_fig, "synthpop_relative_efficiency.pdf"),
+         plot = re_plot_obj_synthpop, width = 7.0, height = 4.8, dpi = 300)
+}
+
+# 5) Group fairness boxplot (gg_grp)
+if (exists("gg_grp") && inherits(gg_grp, "ggplot")) {
+  ggsave(file.path(out_dir_fig, "synthpop_group_fairness_WL_box.pdf"),
+         plot = gg_grp, width = 7.2, height = 4.8, dpi = 300)
+}
+
+if (exists("gg_grp_2") && inherits(gg_grp_2, "ggplot")) {
+  ggplot2::ggsave(
+    filename = file.path(out_dir_fig, "synthpop_group_fairness_Gebtyp25_box.pdf"),
+    plot = gg_grp_2, width = 7.2, height = 4.8, dpi = 300
+  )
+}
+
+# ---------------- Tables (LaTeX) ----------------
+
+# helper to save a LaTeX table from a data.frame/tibble
+.save_tex <- function(df, path, caption = NULL, label = NULL, align = NULL) {
+  # Use knitr::kable; keep minimal dependencies and robust output
+  tab <- knitr::kable(df, format = "latex", booktabs = TRUE,
+                      caption = caption, label = label, align = align, longtable = FALSE)
+  cat(tab, file = path)
+}
+
+# A) SRMSE table (srmse_df)
+if (exists("srmse_df")) {
+  .save_tex(
+    srmse_df,
+    file.path(out_dir_tab, "tab_synthpop_srmse.tex"),
+    caption = "Synthpop: SRMSE on selected categorical cross-tabs.",
+    label   = "tab:synthpop:srmse"
+  )
+}
+
+# B) Regression coefficients table (coef_tab_synthpop)
+if (exists("coef_tab_synthpop")) {
+  .save_tex(
+    coef_tab_synthpop,
+    file.path(out_dir_tab, "tab_synthpop_coef.tex"),
+    caption = "Synthpop: Regression coefficients (real vs. synthetic).",
+    label   = "tab:synthpop:coef"
+  )
+}
+
+# C) Relative Efficiency table (re_tab_synthpop)
+if (exists("re_tab_synthpop")) {
+  .save_tex(
+    re_tab_synthpop,
+    file.path(out_dir_tab, "tab_synthpop_re.tex"),
+    caption = "Synthpop: Relative Efficiency (RE) by term.",
+    label   = "tab:synthpop:re"
+  )
+}
+
+# D) Predictive parity metrics (perf_synthpop)
+if (exists("perf_synthpop")) {
+  .save_tex(
+    perf_synthpop,
+    file.path(out_dir_tab, "tab_synthpop_predictive_parity.tex"),
+    caption = "Synthpop: Predictive performance on real holdout (TRTR vs TSTR).",
+    label   = "tab:synthpop:predparity"
+  )
+}
+
+# E) Hellinger distances (hd_df_1)
+if (exists("hd_df_1")) {
+  .save_tex(
+    hd_df_1,
+    file.path(out_dir_tab, "tab_synthpop_hellinger.tex"),
+    caption = "Synthpop: Hellinger distance for numeric variables.",
+    label   = "tab:synthpop:hellinger"
+  )
+}
+
+# F) Group fairness mean table by WL (agg)
+if (exists("agg")) {
+  .save_tex(
+    agg,
+    file.path(out_dir_tab, "tab_synthpop_wl_means.tex"),
+    caption = "Synthpop: Group-wise means by WL (real vs. synthetic).",
+    label   = "tab:synthpop:wlmeans"
+  )
+}
+
+# ---- Done ----
+message("All synthpop evaluation outputs exported to: ",
+        normalizePath(out_dir_fig, winslash = "/"), " (figures), and ",
+        normalizePath(out_dir_tab, winslash = "/"), " (LaTeX tables).")
+
+```
+
