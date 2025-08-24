@@ -1,0 +1,359 @@
+---
+title: "ARF"
+author: "Ziqi Xu"
+date: "2025-08-20"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+# ---- Packages ----
+pkgs <- c("dplyr","ranger","ggplot2","GGally","rsample","yardstick")
+to_install <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if (length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(202508)
+```
+
+```{r message=FALSE, warning=FALSE}
+# ---- Column Types and Column Sets ----
+score_cols_arf  <- c("bad.score.25","kue.score.23")
+factor_cols_arf <- c("Zentral","WL","Gebtyp.25","Haustyp.23","HZ.unvoll","Fussboden.HZ",
+                     "bad.score.25","Kueche.offen","Modern.Boden","Balkon.Terrasse",
+                     "Besond.Ausst","Modern.Fenster")
+num_cols_arf    <- c("nmqm","wfl.gekappt","bj","(weights)")
+wcol_arf        <- "(weights)"
+```
+
+```{r message=FALSE, warning=FALSE}
+for (v in intersect(score_cols_arf, names(data.xu))) {
+  vals <- suppressWarnings(as.integer(as.character(data.xu[[v]])))
+  if (all(!is.na(vals))) {
+    lvls <- sort(unique(vals))
+    data.xu[[v]] <- ordered(factor(vals, levels = lvls), levels = lvls)
+  } else {
+    lvls <- sort(unique(as.character(data.xu[[v]])))
+    data.xu[[v]] <- ordered(factor(data.xu[[v]], levels = lvls), levels = lvls)
+  }
+}
+for (v in intersect(factor_cols_arf, names(data.xu))) data.xu[[v]] <- as.factor(data.xu[[v]])
+for (v in intersect(num_cols_arf,    names(data.xu))) data.xu[[v]] <- as.numeric(data.xu[[v]])
+```
+
+
+```{r message=FALSE, warning=FALSE}
+# ============ Initial synthesis pool (by margin)===========
+X_syn_arf <- as.data.frame(matrix(nrow = n_syn_arf, ncol = ncol(X_real_arf)))
+names(X_syn_arf) <- names(X_real_arf)
+
+for (j in names(X_real_arf)) {
+  xj <- X_real_arf[[j]]
+  if (is.factor(xj) || is.ordered(xj)) {
+    ptab <- prop.table(table(xj))
+    smp  <- sample(names(ptab), size = n_syn_arf, replace = TRUE, prob = as.numeric(ptab))
+    if (is.ordered(xj)) {
+      X_syn_arf[[j]] <- ordered(factor(smp, levels = levels(xj)), levels = levels(xj))
+    } else {
+      X_syn_arf[[j]] <- factor(smp, levels = levels(xj))
+    }
+  } else if (is.numeric(xj)) {
+    u <- runif(n_syn_arf)
+    X_syn_arf[[j]] <- as.numeric(quantile(xj, probs = u, na.rm = TRUE))
+  } else {
+    X_syn_arf[[j]] <- sample(xj, size = n_syn_arf, replace = TRUE)
+  }
+}
+```
+
+```{r message=FALSE, warning=FALSE}
+# ============ ARF countercycle ============
+T_max_arf      <- 10
+trees_arf      <- 200
+min_node_arf   <- 20
+target_auc_arf <- 0.55
+verbose_arf    <- TRUE
+
+for (t in 1:T_max_arf) {
+  if (verbose_arf) message(sprintf("== ARF iter %d ==", t))
+
+  # 1) Discriminate forest (true = 1, synthetic = 0)
+  lab_arf   <- c(rep(1, nrow(X_real_arf)), rep(0, nrow(X_syn_arf)))
+  train_arf <- rbind(X_real_arf, X_syn_arf)
+  train_arf$._y <- factor(lab_arf)
+  rf_arf <- ranger::ranger(
+    formula       = ._y ~ .,
+    data          = train_arf,
+    num.trees     = trees_arf,
+    mtry          = floor(sqrt(ncol(X_real_arf))),
+    min.node.size = min_node_arf,
+    probability   = TRUE
+  )
+
+  # 2) Terminal leaf allocation (one leaf index vector per tree)
+  term_real_arf <- predict(rf_arf, data = X_real_arf, type = "terminalNodes")$predictions
+  # term_syn_arf  <- predict(rf_arf, data = X_syn_arf,  type = "terminalNodes")$predictions  # 此处不使用
+
+  # 3) Based on the leaves of each tree, “row resampling” within the leaves generates blocks.
+  blocks_list_arf <- vector("list", length = ncol(term_real_arf))
+  for (tree_id_arf in seq_len(ncol(term_real_arf))) {
+    leaves_real_vec_arf <- term_real_arf[, tree_id_arf]
+    tab_real_arf <- table(leaves_real_vec_arf)
+
+    # New sample blocks generated for this tree
+    X_block_arf <- X_real_arf[0, , drop = FALSE]
+
+    for (leaf_id_arf in names(tab_real_arf)) {
+      idx_pool_arf <- which(leaves_real_vec_arf == as.integer(leaf_id_arf))
+      k_target_arf <- as.integer(tab_real_arf[[leaf_id_arf]])
+
+      # Row resampling: sampling directly from rows of real leaves
+      if (length(idx_pool_arf) > 0 && k_target_arf > 0) {
+        idx_draw_arf <- sample(idx_pool_arf, size = k_target_arf, replace = TRUE)
+        block_arf    <- X_real_arf[idx_draw_arf, , drop = FALSE]
+        X_block_arf  <- rbind(X_block_arf, block_arf)
+      }
+    }
+    blocks_list_arf[[tree_id_arf]] <- X_block_arf
+  }
+
+  # 4) Merge and truncate to n_syn_arf
+  X_syn_new_arf <- do.call(rbind, blocks_list_arf)
+  if (nrow(X_syn_new_arf) >= n_syn_arf) {
+    sel_idx <- sample.int(nrow(X_syn_new_arf), n_syn_arf, replace = FALSE)
+    X_syn_new_arf <- X_syn_new_arf[sel_idx, , drop = FALSE]
+  } else {
+    need_k <- n_syn_arf - nrow(X_syn_new_arf)
+    add_idx <- sample.int(nrow(X_real_arf), size = need_k, replace = TRUE)
+    X_syn_new_arf <- rbind(X_syn_new_arf, X_real_arf[add_idx, , drop = FALSE])
+  }
+
+  # 5) Update synthesis pool
+  X_syn_arf <- X_syn_new_arf
+
+  # 6) Convergence monitoring: If the AUC is close to 0.5, it is considered indistinguishable.
+  lab2_arf <- c(rep(1, nrow(X_real_arf)), rep(0, nrow(X_syn_arf)))
+  mix_arf  <- rbind(X_real_arf, X_syn_arf)
+  fit_auc_arf <- ranger::ranger(factor(lab2_arf) ~ ., data = data.frame(mix_arf, lab2_arf=factor(lab2_arf)),
+                                num.trees = 200, probability = TRUE, min.node.size = 20)
+  pr_auc_arf <- predict(fit_auc_arf, data = data.frame(mix_arf, lab2_arf=factor(lab2_arf)))$predictions[, "1"]
+  auc_now_arf <- yardstick::roc_auc_vec(truth = factor(lab2_arf), estimate = pr_auc_arf) %>% as.numeric()
+
+  if (verbose_arf) message(sprintf("discriminator AUC = %.3f", auc_now_arf))
+  if (!is.na(auc_now_arf) && auc_now_arf <= target_auc_arf) {
+    if (verbose_arf) message("AUC close to random; early stop.")
+    break
+  }
+}
+```
+
+```{r message=FALSE, warning=FALSE}
+# ============ Post-processing: Weight and type alignment ============
+syn_data_arf <- X_syn_arf
+
+# Restore weighting columns (simple method: random sampling from actual margins)
+if (wcol_arf %in% names(data.xu)) {
+  syn_data_arf[[wcol_arf]] <- sample(data.xu[[wcol_arf]], size = nrow(syn_data_arf), replace = TRUE)
+}
+
+# Forced alignment with horizontal alignment (consistent with actual)
+common_cols_arf <- intersect(names(data.xu), names(syn_data_arf))
+for (v in common_cols_arf) {
+  if (is.factor(data.xu[[v]]) && !is.factor(syn_data_arf[[v]])) {
+    syn_data_arf[[v]] <- factor(as.character(syn_data_arf[[v]]), levels = levels(data.xu[[v]]))
+  }
+  if (is.ordered(data.xu[[v]]) && !is.ordered(syn_data_arf[[v]])) {
+    syn_data_arf[[v]] <- ordered(
+      factor(as.character(syn_data_arf[[v]]), levels = levels(data.xu[[v]])),
+      levels = levels(data.xu[[v]])
+    )
+  }
+}
+```
+
+```{r warning=FALSE}
+# ============ Evaluation: Consistent with synthpop/simPop standards. ============
+real_arf <- data.xu
+syn_arf  <- syn_data_arf
+
+common_cols_arf <- intersect(names(real_arf), names(syn_arf))
+real_arf <- real_arf[, common_cols_arf, drop = FALSE]
+syn_arf  <- syn_arf [, common_cols_arf, drop = FALSE]
+
+# Ordered scoring consistency
+for (v in intersect(score_cols_arf, names(real_arf))) {
+  lv <- levels(real_arf[[v]])
+  real_arf[[v]] <- ordered(real_arf[[v]], levels = lv)
+  syn_arf [[v]] <- ordered(syn_arf [[v]], levels = lv)
+}
+
+# 1) Univariate distribution (numerical series)
+is_num_arf <- sapply(real_arf, is.numeric)
+num_cols_eval_arf <- names(real_arf)[is_num_arf]
+if (length(num_cols_eval_arf) > 0) {
+  show_vars <- head(num_cols_eval_arf, 3)
+  for (vv in show_vars) {
+    dfp <- dplyr::bind_rows(
+      real_arf %>% dplyr::select(dplyr::all_of(vv)) %>% dplyr::mutate(source="Real"),
+      syn_arf  %>% dplyr::select(dplyr::all_of(vv)) %>% dplyr::mutate(source="Synthetic_ARF")
+    )
+    print(
+      ggplot(dfp, aes_string(x = vv, fill = "source", color = "source")) +
+        geom_histogram(aes(y = ..density..), bins = 30, alpha = 0.45, position = "identity") +
+        geom_density(size = 1.1, alpha = 0) +
+        labs(title = paste("Univariate:", vv), x = vv, y = "Density") +
+        theme_minimal()
+    )
+  }
+}
+
+# 1.2 Related structures (numerical series)
+if (length(num_cols_eval_arf) >= 2) {
+  print(GGally::ggcorr(as.data.frame(real_arf[, num_cols_eval_arf]), label=TRUE) + ggtitle("Correlation (Real)"))
+  print(GGally::ggcorr(as.data.frame(syn_arf [, num_cols_eval_arf]), label=TRUE) + ggtitle("Correlation (Synthetic_ARF)"))
+}
+
+# 1.3 Contingency table SRMSE (three pairs of categories)
+SRMSE_arf <- function(obs, exp) { eps <- 1e-9; sqrt(mean(((obs-exp)/(sqrt((obs+exp)/2)+eps))^2)) }
+cat_pairs_arf <- list(c("WL","Gebtyp.25"), c("Haustyp.23","Boden.Fak.23"), c("bj", "Modern.Fenster"))
+cat_pairs_arf <- Filter(function(v) all(v %in% names(real_arf)), cat_pairs_arf)
+srmse_df_arf <- dplyr::bind_rows(lapply(cat_pairs_arf, function(vp){
+  v1 <- vp[1]; v2 <- vp[2]
+  tab_r <- prop.table(table(real_arf[[v1]], real_arf[[v2]]))
+  tab_s <- prop.table(table(syn_arf [[v1]], syn_arf [[v2]]))
+  all_lv1 <- union(rownames(tab_r), rownames(tab_s))
+  all_lv2 <- union(colnames(tab_r), colnames(tab_s))
+  tab_r <- tab_r[all_lv1, all_lv2, drop=FALSE]; tab_r[is.na(tab_r)] <- 0
+  tab_s <- tab_s[all_lv1, all_lv2, drop=FALSE]; tab_s[is.na(tab_s)] <- 0
+  data.frame(pair=paste(v1,"x",v2), SRMSE = SRMSE_arf(as.vector(tab_r), as.vector(tab_s)))
+}))
+print(srmse_df_arf)
+```
+
+```{r warning=FALSE}
+# 2) Analysis utility: regression coefficient, RE, TRTR vs TSTR
+reg_formula_arf <- as.formula(paste(
+  target_arf,
+  "~ wfl.gekappt + bj + Zentral + WL + Modern.Boden + Modern.Fenster + Balkon.Terrasse"
+))
+
+#Model containing all variables
+target_arf <- if ("nmqm" %in% names(real_arf)) "nmqm" else num_cols_eval_arf[1]
+exclude_arf <- c(target_arf, wcol_arf)
+preds_arf   <- setdiff(names(real_arf), exclude_arf)
+reg_formula_arf_full <- as.formula(paste(target_arf, "~", paste(preds_arf, collapse = " + ")))
+
+fit_real_arf <- lm(reg_formula_arf, data = real_arf)
+fit_syn_arf  <- lm(reg_formula_arf, data = syn_arf)
+
+fit_real_arf_full <- lm(reg_formula_arf_full, data = real_arf)
+fit_syn_arf_full  <- lm(reg_formula_arf_full, data = syn_arf)
+
+
+coef_tab_arf <- data.frame(term = names(coef(fit_real_arf)),
+                           beta_real = coef(fit_real_arf),
+                           beta_syn  = coef(fit_syn_arf))
+
+coef_tab_arf_full <- data.frame(term = names(coef(fit_real_arf_full)),
+                           beta_real = coef(fit_real_arf_full),
+                           beta_syn  = coef(fit_syn_arf_full))
+
+
+se_real_arf <- sqrt(diag(vcov(fit_real_arf)))
+se_syn_arf  <- sqrt(diag(vcov(fit_syn_arf)))
+re_tab_arf  <- data.frame(term=names(se_real_arf),
+                          SE_real=as.numeric(se_real_arf),
+                          SE_syn =as.numeric(se_syn_arf),
+                          RE = (as.numeric(se_syn_arf)^2)/(as.numeric(se_real_arf)^2))
+print(re_tab_arf)
+
+print(
+  ggplot(coef_tab_arf_full[-1,], aes(x = beta_real, y = beta_syn)) +
+    geom_point(alpha=.7) + geom_abline(slope=1, intercept=0, linetype="dashed", color="red") +
+    labs(title="Coefficient Agreement (Real vs ARF Synthetic)", x="β (Real)", y="β (ARF Syn)") +
+    theme_minimal()
+)
+
+print(
+  ggplot(re_tab_arf, aes(x = term, y = RE)) +
+    geom_col(width=.6, fill = "skyblue") + geom_hline(yintercept=1, linetype="dashed", color="darkred") +
+    labs(title="Relative Efficiency (Ideal=1)", x=NULL, y="RE = (SE_syn^2 / SE_real^2)") +
+    theme_minimal() + theme(axis.text.x = element_text(angle=50, hjust=1))
+)
+
+# TRTR vs TSTR
+set.seed(202508)
+split_arf <- rsample::initial_split(real_arf, prop=0.8)
+train_real_arf <- rsample::training(split_arf)
+test_real_arf  <- rsample::testing(split_arf)
+
+fit_trtr_arf <- lm(reg_formula_arf, data = train_real_arf)
+fit_tstr_arf <- lm(reg_formula_arf, data = syn_arf)
+
+pred_trtr_arf <- predict(fit_trtr_arf, newdata = test_real_arf)
+pred_tstr_arf <- predict(fit_tstr_arf, newdata = test_real_arf)
+
+perf_arf <- tibble::tibble(
+  model = c("TRTR","TSTR"),
+  RMSE  = c(yardstick::rmse_vec(test_real_arf[[target_arf]], pred_trtr_arf),
+            yardstick::rmse_vec(test_real_arf[[target_arf]], pred_tstr_arf)),
+  MAE   = c(yardstick::mae_vec (test_real_arf[[target_arf]], pred_trtr_arf),
+            yardstick::mae_vec (test_real_arf[[target_arf]], pred_tstr_arf))
+)
+print(perf_arf)
+```
+
+```{r message=FALSE, warning=FALSE}
+# 3) Privacy proxy: Quasi-identifier matching rate (lower is better)
+qid_arf <- c("WL","Gebtyp.25","Haustyp.23","Boden.Fak.23","bj","wfl.gekappt") %>% intersect(names(real_arf))
+disc_arf <- function(x, bins=10) if (is.numeric(x)) cut(x, breaks = unique(quantile(x, probs=seq(0,1,length.out=bins+1), na.rm=TRUE)), include.lowest=TRUE) else x
+R_key_arf <- do.call(paste, c(as.data.frame(lapply(real_arf[qid_arf], disc_arf)), sep="|"))
+S_key_arf <- do.call(paste, c(as.data.frame(lapply(syn_arf [qid_arf], disc_arf)), sep="|"))
+cat(sprintf("Naive re-identification match rate (ARF): %.4f\n", mean(R_key_arf %in% S_key_arf)))
+```
+
+```{r}
+# 4) Hellinger distance (first 5 values; lower is better)
+hellinger_arf <- function(p, q) sqrt(sum((sqrt(p)-sqrt(q))^2))/sqrt(2)
+hd_df_arf <- dplyr::bind_rows(lapply(head(num_cols_eval_arf,5), function(v){
+  br <- pretty(range(c(real_arf[[v]], syn_arf[[v]]), na.rm=TRUE), n=20)
+  pr <- hist(real_arf[[v]], breaks=br, plot=FALSE)
+  ps <- hist(syn_arf [[v]], breaks=br, plot=FALSE)
+  p <- pr$counts/sum(pr$counts); q <- ps$counts/sum(ps$counts)
+  data.frame(var=v, Hellinger=hellinger_arf(p,q))
+}))
+print(hd_df_arf)
+
+# ---------- Group Fairness Check (ARF) ----------
+grp_arf <- "WL"
+if (grp_arf %in% fac_cols) {
+  agg_real_arf <- real_arf %>%
+    group_by(.data[[grp_arf]]) %>%
+    summarize(mean_target = mean(.data[[target_arf]], na.rm = TRUE), .groups = "drop")
+  
+  agg_syn_arf  <- syn_data_arf %>%
+    group_by(.data[[grp_arf]]) %>%
+    summarize(mean_target = mean(.data[[target_arf]], na.rm = TRUE), .groups = "drop")
+  
+  agg_arf <- full_join(
+    agg_real_arf %>% rename(mean_real = mean_target),
+    agg_syn_arf  %>% rename(mean_syn  = mean_target),
+    by = grp_arf
+  )
+  print(agg_arf)
+  
+  gg_grp_arf <- bind_rows(
+    real_arf %>% mutate(source = "Real"),
+    syn_data_arf %>% mutate(source = "Synthetic")
+  ) %>%
+    ggplot(aes(x = .data[[grp_arf]], y = .data[[target_arf]], fill = source)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6,
+                 position = position_dodge(width = 0.8)) +
+    coord_cartesian(ylim = quantile(real_arf[[target_arf]], c(0.02, 0.98), na.rm = TRUE)) +
+    labs(title = paste("Group-wise distribution of", target_arf, "by", grp_arf),
+         x = grp_arf, y = target_arf) +
+    theme_minimal()
+  
+  print(gg_grp_arf)
+}
+```
+
