@@ -1,0 +1,582 @@
+---
+title: "simpop"
+author: "Ziqi Xu"
+date: "2025-08-20"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+# ---- Packages ----
+# install.packages(c("simPop","dplyr","tidyr"))
+library(simPop)
+library(dplyr)
+library(tidyr)
+
+set.seed(202508)
+
+# ========= 0) Input and Basic Settings =========
+# The sample data frame is data.xu (type standardized, (weights) is numeric).
+
+# Select the discrete variables for the “Overall Skeleton” (for IPF calibration)
+backbone_vars_sim <- c("WL","Gebtyp.25","Haustyp.23","Boden.Fak.23")
+
+# Continuous/semi-continuous variables (generated/resampled using conditional models)
+cont_vars_sim <- c("nmqm","wfl.gekappt","bj")
+
+wcol_sim <- "(weights)"
+
+# ========= 1) Generate target margin =========
+
+make_weighted_prop <- function(df, var, w) {
+  df %>% group_by(.data[[var]]) %>%
+    summarize(wt = sum(.data[[w]], na.rm = TRUE), .groups = "drop") %>%
+    mutate(p = wt / sum(wt)) %>% select(all_of(var), p)
+}
+
+marg_WL_sim <- make_weighted_prop(data.xu, "WL", wcol_sim)
+marg_Geb_sim <- make_weighted_prop(data.xu, "Gebtyp.25", wcol_sim)
+marg_Haus_sim <- make_weighted_prop(data.xu, "Haustyp.23", wcol_sim)
+marg_Boden_sim <- make_weighted_prop(data.xu, "Boden.Fak.23", wcol_sim)
+
+# Binary joint table (example)：WL × Gebtyp.25
+tab_WL_Geb_sim <- data.xu %>%
+  count(WL, Gebtyp.25, wt = .data[[wcol_sim]], name = "wt") %>%
+  group_by(WL) %>%
+  mutate(p = wt / sum(wt)) %>% ungroup() %>%
+  select(WL, Gebtyp.25, p)
+
+# Pack the margins (subsequent customization of IPF)
+margins_sim <- list(
+  WL          = marg_WL_sim,
+  Gebtyp.25   = marg_Geb_sim,
+  Haustyp.23  = marg_Haus_sim,
+  Boden.Fak.23= marg_Boden_sim,
+  WLxGeb      = tab_WL_Geb_sim
+)
+
+# ========= 2) Build skeleton cells and perform IPF (simple implementation) =========
+# First, let's take the Cartesian product of backbone_vars_sim as “cells”.
+# Then use iterative ratio fitting (by row/by column) to align the ratios to the target margin and the joint table.
+# To be on the safe side, I'll write a “small IPF assistant” here.
+
+# 2.1 List all cells
+make_cells <- function(df, vars) {
+  lvs <- lapply(vars, function(v) sort(unique(df[[v]])))
+  names(lvs) <- vars
+  cells <- expand.grid(lvs, KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+  cells
+}
+cells_sim <- make_cells(data.xu, backbone_vars_sim) %>%
+  mutate(p = 1 / n())   # Initial uniformity
+
+# 2.2 Align single margins
+align_marginal <- function(cells, var, target_df, iter=1) {
+  # target_df: columns var, p
+  cells %>%
+    left_join(target_df, by = var, suffix = c("", ".t")) %>%
+    group_by(.data[[var]]) %>%
+    mutate(p = ifelse(p.t > 0,
+                      p * (p.t / sum(p)),  # This layer target/existing
+                      p)) %>%
+    ungroup() %>% select(-p.t)
+}
+
+# 2.3 
+align_bitable <- function(cells, var1, var2, target_df) {
+  # target_df: var1, var2, p 
+  cells %>%
+    left_join(target_df, by = c(var1, var2), suffix = c("", ".t")) %>%
+    group_by(.data[[var1]]) %>%
+    mutate(p = ifelse(!is.na(p.t) & p.t > 0,
+                      p * (p.t / (sum(p) / n_distinct(.data[[var2]]))),
+                      p)) %>%
+    ungroup() %>% select(-p.t)
+}
+
+# 2.4 Simple IPF cycle (if there are more constraints, repeat the cycle multiple times)
+for (t in 1:8) {
+  cells_sim <- align_marginal(cells_sim, "WL",          margins_sim$WL)
+  cells_sim <- align_marginal(cells_sim, "Gebtyp.25",   margins_sim$Gebtyp.25)
+  cells_sim <- align_marginal(cells_sim, "Haustyp.23",  margins_sim$Haustyp.23)
+  cells_sim <- align_marginal(cells_sim, "Boden.Fak.23",margins_sim$Boden.Fak.23)
+  cells_sim <- align_bitable(cells_sim, "WL","Gebtyp.25", margins_sim$WLxGeb)
+  # normalization
+  cells_sim$p <- cells_sim$p / sum(cells_sim$p)
+}
+
+# ========= 3) Generate a classification skeleton for the “composite total” =========
+Nstar_sim <- round(nrow(data.xu))  # First, it should be comparable to the sample size; if the total N is available, it can be replaced.
+# Sample according to cells_sim$p to obtain the classification skeleton for each synthetic record.
+ind_sim <- sample.int(n = nrow(cells_sim), size = Nstar_sim, replace = TRUE, prob = cells_sim$p)
+pop_cat_sim <- cells_sim[ind_sim, , drop = FALSE]
+pop_cat_sim$row_id_sim <- seq_len(Nstar_sim)
+
+# ========= 4) Fill other variables into the skeleton =========
+# 4.1 Categorical variables: Use conditional models (here, we first use naive conditional probability/resampling)
+fill_factor <- function(target_var, given_vars, sample_df, new_df) {
+  # For each given combination, sample target_var from the sample according to weight.
+  # If the combination is sparse, fall back to the marginal distribution.
+  new_df %>%
+    left_join(
+      sample_df %>%
+        group_by(across(all_of(given_vars)), .drop = FALSE) %>%
+        reframe(level = sample(.data[[target_var]], size = 1,
+                               prob = NULL)) %>%
+        rename(!!target_var := level),
+      by = given_vars
+    ) %>%
+    rename(!!target_var := !!sym(target_var))
+}
+
+# 4.2 Continuous/semi-continuous variables: Intraclass regression or resampling
+# Conservative version: Within the (WL, Gebtyp.25) group, perform weighted resampling on nmqm/wfl.gekappt/bj.
+fill_numeric_by_group <- function(var, group_vars, sample_df, new_df, wcol) {
+  new_df %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars)), .drop = FALSE) %>%
+    # .x = data in the group (without keys); .y = one-row tibble of the group keys
+    dplyr::group_modify(~{
+      key  <- .y  # <-- use .y as the key (contains columns in group_vars)
+      pool <- sample_df %>%
+        dplyr::semi_join(key, by = group_vars) %>%
+        dplyr::filter(!is.na(.data[[var]]))
+
+      if (nrow(pool) == 0) {
+        pool <- sample_df %>% dplyr::filter(!is.na(.data[[var]]))
+      }
+
+      draws <- base::sample(
+        pool[[var]],
+        size    = nrow(.x),
+        replace = TRUE,
+        prob    = if (wcol %in% names(pool)) pool[[wcol]] else NULL
+      )
+
+      .x[[var]] <- draws
+      .x
+    }) %>%
+    dplyr::ungroup()
+}
+
+# Fitting/Filling
+pop_sim <- pop_cat_sim %>% select(-p) %>%   # Only skeleton columns + row_id_sim
+  # Continuous variables were re-sampled within groups.
+  {fill_numeric_by_group("nmqm",        c("WL","Gebtyp.25"), sample_small_sim, ., wcol_sim)} %>%
+  {fill_numeric_by_group("wfl.gekappt", c("WL","Gebtyp.25"), sample_small_sim, ., wcol_sim)} %>%
+  {fill_numeric_by_group("bj",          c("WL","Gebtyp.25"), sample_small_sim, ., wcol_sim)}
+
+# ========= 5) Obtain the synthetic total and “synthetic samples” =========
+Ustar_sim <- pop_sim  # Synthesis total
+# If “composite samples” are required, sampling may be counted.
+syn_sim <- Ustar_sim %>% slice_sample(n = nrow(data.xu), replace = FALSE)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+#### ---------- Setup ----------
+pkgs <- c("dplyr","ggplot2","GGally","rsample","yardstick")
+to_install <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if (length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+set.seed(202508)
+
+# 8 columns we expect to use
+backbone_vars_sim <- c("WL","Gebtyp.25","Haustyp.23","Boden.Fak.23")
+cont_vars_sim     <- c("nmqm","wfl.gekappt","bj")
+row_id_col_sim    <- "row_id_sim"   
+wcol_sim          <- "(weights)"    
+
+# Align columns & types
+common_cols_sim <- intersect(names(data.xu), names(syn_sim))
+real_sim <- data.xu[, common_cols_sim, drop = FALSE]
+syn8_sim <- syn_sim[, common_cols_sim, drop = FALSE]
+
+# Keep only the 8-ish columns(Skeleton + Continuous + Optional Line Numbers/Weights)
+keep_sim <- unique(c(backbone_vars_sim, cont_vars_sim, row_id_col_sim, wcol_sim))
+keep_sim <- intersect(keep_sim, common_cols_sim)
+real_sim <- real_sim[, keep_sim, drop = FALSE]
+syn8_sim <- syn8_sim[, keep_sim, drop = FALSE]
+
+# Ensure factor types are identical
+for (v in intersect(backbone_vars_sim, names(real_sim))) {
+  lv <- union(levels(as.factor(real_sim[[v]])), levels(as.factor(syn8_sim[[v]])))
+  real_sim[[v]] <- factor(as.character(real_sim[[v]]), levels = lv)
+  syn8_sim [[v]] <- factor(as.character(syn8_sim [[v]]), levels = lv)
+}
+
+# Target
+target_sim <- if ("nmqm" %in% names(real_sim)) "nmqm" else cont_vars_sim[1]
+
+#### ---------- 1) Descriptive utility ----------
+# 1.1 Histogram + density lines (ideal: visual overlap)
+plot_univariate_numeric_sim <- function(var) {
+  df <- dplyr::bind_rows(
+    real_sim %>% dplyr::select(dplyr::all_of(var)) %>% dplyr::mutate(source="Real"),
+    syn8_sim %>% dplyr::select(dplyr::all_of(var)) %>% dplyr::mutate(source="Synthetic")
+  )
+  ggplot(df, aes_string(x = var, fill = "source", color = "source")) +
+    geom_histogram(aes(y = ..density..), alpha = 0.45, position = "identity", bins = 30) +
+    geom_density(size = 1.2, alpha = 0) +
+    labs(title = paste("Histogram + Density:", var), x = var, y = "Density") +
+    theme_minimal()
+}
+p_nmqm_sim <- plot_univariate_numeric_sim(target_sim)
+p_wfl_sim  <- if ("wfl.gekappt" %in% names(real_sim)) plot_univariate_numeric_sim("wfl.gekappt") else NULL
+p_bj_sim   <- if ("bj" %in% names(real_sim))          plot_univariate_numeric_sim("bj")          else NULL
+print(p_nmqm_sim); if(!is.null(p_wfl_sim)) print(p_wfl_sim); if(!is.null(p_bj_sim)) print(p_bj_sim)
+
+# 1.2 Correlation heatmaps (numeric only)
+num_cols_sim <- names(real_sim)[sapply(real_sim, is.numeric)]
+if (length(num_cols_sim) >= 2) {
+  print(GGally::ggcorr(as.data.frame(real_sim[, num_cols_sim]),  label = TRUE) + ggtitle("Correlation (Real)"))
+  print(GGally::ggcorr(as.data.frame(syn8_sim[, num_cols_sim]),  label = TRUE) + ggtitle("Correlation (Synthetic)"))
+}
+
+# 1.3 Cross-tab SRMSE for three pairs (Three sets of skeletons)
+SRMSE_sim <- function(obs, exp) {
+  eps <- 1e-9
+  sqrt(mean(((obs - exp) / (sqrt((obs + exp)/2) + eps))^2))
+}
+cat_pairs_sim <- list(
+  c("WL", "Gebtyp.25"),
+  c("Haustyp.23", "Boden.Fak.23"),
+  c("WL", "Haustyp.23")
+)
+cat_pairs_sim <- Filter(function(v) all(v %in% names(real_sim)), cat_pairs_sim)
+srmse_list_sim <- lapply(cat_pairs_sim, function(vp){
+  v1 <- vp[1]; v2 <- vp[2]
+  tab_r <- prop.table(table(real_sim[[v1]], real_sim[[v2]]))
+  tab_s <- prop.table(table(syn8_sim [[v1]], syn8_sim [[v2]]))
+  all_lv1 <- union(rownames(tab_r), rownames(tab_s))
+  all_lv2 <- union(colnames(tab_r), colnames(tab_s))
+  tab_r <- tab_r[all_lv1, all_lv2, drop=FALSE]; tab_r[is.na(tab_r)] <- 0
+  tab_s <- tab_s[all_lv1, all_lv2, drop=FALSE]; tab_s[is.na(tab_s)] <- 0
+  data.frame(pair = paste(v1, v2, sep = " x "), SRMSE = SRMSE_sim(as.vector(tab_r), as.vector(tab_s)))
+})
+srmse_df_sim <- dplyr::bind_rows(srmse_list_sim)
+print(srmse_df_sim)
+
+#### ---------- 2) Analytical utility ----------
+# 2.1 Regression (ALL predictors except target, row_id, weights)
+exclude_sim <- c(target_sim, row_id_col_sim, wcol_sim)
+predictors_all_sim <- setdiff(names(real_sim), exclude_sim)
+reg_formula_sim <- as.formula(paste(target_sim, "~", paste(predictors_all_sim, collapse = " + ")))
+
+fit_real_sim <- lm(reg_formula_sim, data = real_sim)
+fit_syn_sim  <- lm(reg_formula_sim, data = syn8_sim)
+
+coef_tab_sim <- data.frame(
+  term      = names(coef(fit_real_sim)),
+  beta_real = coef(fit_real_sim),
+  beta_syn  = coef(fit_syn_sim)
+)
+coef_tab_sim <- coef_tab_sim[-1, ]
+print(coef_tab_sim)
+
+
+# Coeff agreement plot (ideal y=x)
+coef_plot_df_sim <- coef_tab_sim; names(coef_plot_df_sim) <- c("term","beta_real","beta_syn")
+print(
+  ggplot(coef_plot_df_sim, aes(x = beta_real, y = beta_syn)) +
+    geom_point(alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    labs(title = "Coefficient Agreement (Ideal: y = x)", x = "β (Real)", y = "β (Synthetic)") +
+    theme_minimal()
+)
+
+# 2.1 RE
+se_real_sim <- sqrt(diag(vcov(fit_real_sim)))
+se_syn_sim  <- sqrt(diag(vcov(fit_syn_sim)))
+re_tab_sim <- data.frame(
+  term   = names(se_real_sim),
+  SE_real= as.numeric(se_real_sim),
+  SE_syn = as.numeric(se_syn_sim),
+  RE     = (as.numeric(se_syn_sim)^2)/(as.numeric(se_real_sim)^2)
+)
+print(re_tab_sim)
+
+# RE plot (ideal = 1)
+re_plot_df_sim <- re_tab_sim
+if (nrow(re_plot_df_sim) > 20) re_plot_df_sim <- re_plot_df_sim[1:20, ]
+re_plot_df_sim <- re_plot_df_sim %>%
+  filter(RE < 10)
+re_plot_df_sim$term <- factor(re_plot_df_sim$term, levels = re_plot_df_sim$term)
+
+
+print(
+  ggplot(re_plot_df_sim, aes(x = term, y = RE)) +
+    geom_col(width = 0.6) +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    labs(title = "Relative Efficiency (Ideal = 1)", x = "Term", y = "RE = (SE_syn^2 / SE_real^2)") +
+    theme_minimal() + theme(axis.text.x = element_text(angle = 50, hjust = 1))
+)
+
+# 2.2 Predictive parity: TRTR vs TSTR
+set.seed(202508)
+split_sim <- rsample::initial_split(real_sim, prop = 0.7)
+train_real_sim <- rsample::training(split_sim)
+test_real_sim  <- rsample::testing(split_sim)
+
+fit_trtr_sim <- lm(reg_formula_sim, data = train_real_sim)
+fit_tstr_sim <- lm(reg_formula_sim, data = syn8_sim)
+
+pred_trtr_sim <- predict(fit_trtr_sim, newdata = test_real_sim)
+pred_tstr_sim <- predict(fit_tstr_sim, newdata = test_real_sim)
+
+perf_sim <- tibble::tibble(
+  model = c("TRTR","TSTR"),
+  RMSE  = yardstick::rmse_vec(test_real_sim[[target_sim]], pred_trtr_sim) %>% as.numeric(),
+  MAE   = yardstick::mae_vec (test_real_sim[[target_sim]], pred_trtr_sim) %>% as.numeric()
+) %>%
+  tibble::add_row(model="TSTR", RMSE = yardstick::rmse_vec(test_real_sim[[target_sim]], pred_tstr_sim) %>% as.numeric(),
+                  MAE  = yardstick::mae_vec (test_real_sim[[target_sim]], pred_tstr_sim) %>% as.numeric())
+print(perf_sim)
+
+# RMSE/MAE plots with TRTR baseline
+rmse_trtr_sim <- perf_sim$RMSE[perf_sim$model=="TRTR"][1]
+mae_trtr_sim  <- perf_sim$MAE [perf_sim$model=="TRTR"][1]
+
+print(
+  ggplot(perf_sim, aes(x = model, y = RMSE, fill = model)) +
+    geom_col(width = 0.6, show.legend = FALSE) +
+    geom_hline(yintercept = rmse_trtr_sim, linetype = "dashed") +
+    labs(title = "Predictive Performance (RMSE) — Baseline = TRTR", x = NULL, y = "RMSE on Real Holdout") +
+    theme_minimal()
+)
+print(
+  ggplot(perf_sim, aes(x = model, y = MAE, fill = model)) +
+    geom_col(width = 0.6, show.legend = FALSE) +
+    geom_hline(yintercept = mae_trtr_sim, linetype = "dashed") +
+    labs(title = "Predictive Performance (MAE) — Baseline = TRTR", x = NULL, y = "MAE on Real Holdout") +
+    theme_minimal()
+)
+
+#### ---------- 3) Privacy (naive match rate; ideal = 0) ----------
+qid_sim <- c(backbone_vars_sim, cont_vars_sim) %>% intersect(names(real_sim))
+
+disc_sim <- function(x, bins = 10) {
+  if (is.numeric(x)) cut(x, breaks = unique(quantile(x, probs = seq(0,1,length.out=bins+1), na.rm=TRUE)), include.lowest = TRUE)
+  else x
+}
+R_qid_sim <- as.data.frame(lapply(real_sim[qid_sim], disc_sim))
+S_qid_sim <- as.data.frame(lapply(syn8_sim[qid_sim], disc_sim))
+
+R_key_sim <- do.call(paste, c(R_qid_sim, sep="|"))
+S_key_sim <- do.call(paste, c(S_qid_sim, sep="|"))
+
+match_rate_sim <- mean(R_key_sim %in% S_key_sim)
+cat(sprintf("Naive re-identification match rate (Ideal = 0): %.4f\n", match_rate_sim))
+
+
+#### ---------- 4) Fidelity (Hellinger; ideal = 0) ----------
+hellinger_sim <- function(p, q) sqrt(sum((sqrt(p)-sqrt(q))^2))/sqrt(2)
+
+hd_list_sim <- lapply(cont_vars_sim[cont_vars_sim %in% names(real_sim)], function(v){
+  br <- pretty(range(c(real_sim[[v]], syn8_sim[[v]]), na.rm=TRUE), n = 20)
+  pr <- hist(real_sim[[v]], breaks = br, plot = FALSE)
+  ps <- hist(syn8_sim [[v]], breaks = br, plot = FALSE)
+  p <- pr$counts / sum(pr$counts); q <- ps$counts / sum(ps$counts)
+  data.frame(var = v, Hellinger = hellinger_sim(p, q))
+})
+hd_df_sim <- dplyr::bind_rows(hd_list_sim)
+print(hd_df_sim)
+
+#### ---------- 4.3 Fairness (group-wise means + boxplots) ----------
+# By WL
+agg_WL_sim <- data.frame(); gg_grp_WL_sim <- NULL
+if ("WL" %in% names(real_sim)) {
+  agg_real_WL <- real_sim %>%
+    dplyr::group_by(WL) %>%
+    dplyr::summarize(mean_target = mean(.data[[target_sim]], na.rm = TRUE), .groups = "drop")
+  agg_syn_WL  <- syn8_sim %>%
+    dplyr::group_by(WL) %>%
+    dplyr::summarize(mean_target = mean(.data[[target_sim]], na.rm = TRUE), .groups = "drop")
+  agg_WL_sim  <- dplyr::full_join(
+    agg_real_WL %>% dplyr::rename(mean_real = mean_target),
+    agg_syn_WL  %>% dplyr::rename(mean_syn  = mean_target),
+    by = "WL"
+  )
+  print(agg_WL_sim)
+
+  gg_grp_WL_sim <- dplyr::bind_rows(
+      real_sim %>% dplyr::mutate(source = "Real"),
+      syn8_sim  %>% dplyr::mutate(source = "Synthetic")
+    ) %>%
+    ggplot2::ggplot(ggplot2::aes(x = WL, y = .data[[target_sim]], fill = source)) +
+    ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.6,
+                          position = ggplot2::position_dodge(width = 0.8)) +
+    ggplot2::coord_cartesian(ylim = stats::quantile(real_sim[[target_sim]], c(0.02, 0.98), na.rm = TRUE)) +
+    ggplot2::labs(title = paste("Group-wise", target_sim, "by WL"),
+                  x = "WL", y = target_sim) +
+    ggplot2::theme_minimal()
+  print(gg_grp_WL_sim)
+}
+
+# By Gebtyp.25
+agg_Gebtyp25_sim <- data.frame(); gg_grp_Gebtyp25_sim <- NULL
+if ("Gebtyp.25" %in% names(real_sim)) {
+  agg_real_G <- real_sim %>%
+    dplyr::group_by(`Gebtyp.25`) %>%
+    dplyr::summarize(mean_target = mean(.data[[target_sim]], na.rm = TRUE), .groups = "drop")
+  agg_syn_G  <- syn8_sim %>%
+    dplyr::group_by(`Gebtyp.25`) %>%
+    dplyr::summarize(mean_target = mean(.data[[target_sim]], na.rm = TRUE), .groups = "drop")
+  agg_Gebtyp25_sim <- dplyr::full_join(
+    agg_real_G %>% dplyr::rename(mean_real = mean_target),
+    agg_syn_G  %>% dplyr::rename(mean_syn  = mean_target),
+    by = "Gebtyp.25"
+  )
+  print(agg_Gebtyp25_sim)
+
+  gg_grp_Gebtyp25_sim <- dplyr::bind_rows(
+      real_sim %>% dplyr::mutate(source = "Real"),
+      syn8_sim  %>% dplyr::mutate(source = "Synthetic")
+    ) %>%
+    ggplot2::ggplot(ggplot2::aes(x = .data[["Gebtyp.25"]], y = .data[[target_sim]], fill = source)) +
+    ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.6,
+                          position = ggplot2::position_dodge(width = 0.8)) +
+    ggplot2::coord_cartesian(ylim = stats::quantile(real_sim[[target_sim]], c(0.02, 0.98), na.rm = TRUE)) +
+    ggplot2::labs(title = paste("Group-wise", target_sim, "by Gebtyp.25"),
+                  x = "Gebtyp.25", y = target_sim) +
+    ggplot2::theme_minimal()
+  print(gg_grp_Gebtyp25_sim)
+}
+```
+
+```{r warning=FALSE}
+#### ---------- Export all plots (ggsave) ----------
+pkgs_exp <- c("ggplot2")
+to_install_exp <- pkgs_exp[!(pkgs_exp %in% installed.packages()[,"Package"])]
+if (length(to_install_exp)) install.packages(to_install_exp)
+invisible(lapply(pkgs_exp, library, character.only = TRUE))
+
+out_dir_fig_sim <- "figs/simpop"
+if (!dir.exists(out_dir_fig_sim)) dir.create(out_dir_fig_sim, recursive = TRUE, showWarnings = FALSE)
+
+## 1) Univariate plots
+if (exists("p_nmqm_sim") && inherits(p_nmqm_sim,"ggplot")) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_univar_nmqm.pdf"),
+         p_nmqm_sim, width=6, height=4, dpi=300)
+}
+if (exists("p_wfl_sim") && inherits(p_wfl_sim,"ggplot")) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_univar_wfl.pdf"),
+         p_wfl_sim, width=6, height=4, dpi=300)
+}
+if (exists("p_bj_sim") && inherits(p_bj_sim,"ggplot")) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_univar_bj.pdf"),
+         p_bj_sim, width=6, height=4, dpi=300)
+}
+
+## 2) Correlation heatmaps
+if (exists("num_cols_sim") && length(num_cols_sim)>=2) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_corr_real.pdf"),
+         GGally::ggcorr(as.data.frame(real_sim[, num_cols_sim]), label=TRUE) + ggtitle("Correlation (Real)"),
+         width=6.5, height=5, dpi=300)
+  ggsave(file.path(out_dir_fig_sim,"simpop_corr_syn.pdf"),
+         GGally::ggcorr(as.data.frame(syn8_sim[, num_cols_sim]), label=TRUE) + ggtitle("Correlation (Synthetic)"),
+         width=6.5, height=5, dpi=300)
+}
+
+## 3) Regression: coefficient agreement
+if (exists("coef_plot_df_sim") && nrow(coef_plot_df_sim)>0) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_coef_agreement.pdf"),
+         ggplot(coef_plot_df_sim, aes(x = beta_real, y = beta_syn)) +
+           geom_point(alpha=0.7) +
+           geom_abline(slope=1, intercept=0, linetype="dashed", color="red") +
+           labs(title="Coefficient Agreement", x="β (Real)", y="β (Synthetic)") +
+           theme_minimal(),
+         width=6, height=5, dpi=300)
+}
+
+## 4) Relative efficiency plot
+if (exists("re_plot_df_sim") && nrow(re_plot_df_sim)>0) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_re.pdf"),
+         ggplot(re_plot_df_sim[], aes(x = term, y = RE)) +
+           geom_col(width=0.6, fill = "skyblue") +
+           geom_hline(yintercept=1, linetype="dashed", color="red") +
+           labs(title="Relative Efficiency", x="Term", y="RE") +
+           theme_minimal() +
+           theme(axis.text.x = element_text(angle=50, hjust=1)),
+         width=7, height=5, dpi=300)
+}
+
+## 5) Predictive parity (RMSE, MAE)
+if (exists("perf_sim") && nrow(perf_sim)>0) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_pred_RMSE.pdf"),
+         ggplot(perf_sim, aes(x=model, y=RMSE, fill=model)) +
+           geom_col(width=0.6, show.legend=FALSE) +
+           geom_hline(yintercept=perf_sim$RMSE[perf_sim$model=="TRTR"][1], linetype="dashed") +
+           labs(title="Predictive Performance (RMSE)", y="RMSE") +
+           theme_minimal(),
+         width=6, height=4, dpi=300)
+
+  ggsave(file.path(out_dir_fig_sim,"simpop_pred_MAE.pdf"),
+         ggplot(perf_sim, aes(x=model, y=MAE, fill=model)) +
+           geom_col(width=0.6, show.legend=FALSE) +
+           geom_hline(yintercept=perf_sim$MAE[perf_sim$model=="TRTR"][1], linetype="dashed") +
+           labs(title="Predictive Performance (MAE)", y="MAE") +
+           theme_minimal(),
+         width=6, height=4, dpi=300)
+}
+
+## 6) Fairness plots
+if (exists("gg_grp_WL_sim") && inherits(gg_grp_WL_sim,"ggplot")) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_group_fairness_WL.pdf"),
+         gg_grp_WL_sim, width=7, height=5, dpi=300)
+}
+if (exists("gg_grp_Gebtyp25_sim") && inherits(gg_grp_Gebtyp25_sim,"ggplot")) {
+  ggsave(file.path(out_dir_fig_sim,"simpop_group_fairness_Gebtyp25.pdf"),
+         gg_grp_Gebtyp25_sim, width=7, height=5, dpi=300)
+}
+
+
+#### ---------- Export all tables (csv + tex) ----------
+pkgs_tab <- c("xtable")
+to_install_tab <- pkgs_tab[!(pkgs_tab %in% installed.packages()[,"Package"])]
+if (length(to_install_tab)) install.packages(to_install_tab)
+invisible(lapply(pkgs_tab, library, character.only = TRUE))
+
+out_dir_tab_sim <- "tabs/simpop"
+if (!dir.exists(out_dir_tab_sim)) dir.create(out_dir_tab_sim, recursive = TRUE, showWarnings = FALSE)
+
+save_table <- function(df, name) {
+  if (!exists("df") || is.null(df) || nrow(df)==0) return(NULL)
+  fn_csv <- file.path(out_dir_tab_sim, paste0(name,".csv"))
+  fn_tex <- file.path(out_dir_tab_sim, paste0(name,".tex"))
+  tryCatch({
+    write.csv(df, fn_csv, row.names = FALSE)
+    print(paste("Saved", fn_csv))
+    xt <- xtable::xtable(df, caption = paste("Simpop:", name))
+    print(xtable::print.xtable(xt, file = fn_tex, include.rownames = FALSE))
+    print(paste("Saved", fn_tex))
+  }, error = function(e) message("[skip]", name, ":", e$message))
+}
+
+## 1) SRMSE
+if (exists("srmse_df_sim")) save_table(srmse_df_sim, "srmse")
+
+## 2) Regression coefficients
+if (exists("coef_tab_sim")) save_table(coef_tab_sim, "coef")
+
+## 3) Relative efficiency
+if (exists("re_tab_sim")) save_table(re_tab_sim, "re")
+
+## 4) Predictive parity (TRTR vs TSTR)
+if (exists("perf_sim")) save_table(perf_sim, "predictive_parity")
+
+## 5) Privacy (naive match rate)
+if (exists("match_rate_sim")) {
+  privacy_df_sim <- data.frame(metric="Naive match rate", value=match_rate_sim)
+  save_table(privacy_df_sim, "privacy")
+}
+
+## 6) Fidelity (Hellinger distances)
+if (exists("hd_df_sim")) save_table(hd_df_sim, "hellinger")
+
+## 7) Fairness: WL means
+if (exists("agg_WL_sim")) save_table(agg_WL_sim, "fairness_WL")
+
+## 8) Fairness: Gebtyp.25 means
+if (exists("agg_Gebtyp25_sim")) save_table(agg_Gebtyp25_sim, "fairness_Gebtyp25")
+
+```
+
